@@ -20,13 +20,12 @@ import signal
 import sys
 import time
 
-from gnuradio import blocks, digital, gr, pdu
+from gnuradio import blocks, digital, gr
 from gnuradio import iio
 
 # Protocol constants — must match RX bridge
 SYNC_WORD = 0xDEADBEEF
-PREAMBLE = bytes([0xAA] * 64)
-INTER_PACKET_GAP = bytes([0x00] * 16)  # dead air between RF packets
+PREAMBLE = bytes([0xAA] * 32)
 SYNC_BYTES = struct.pack('>I', SYNC_WORD)
 
 # RF parameters — must match RX bridge
@@ -36,13 +35,11 @@ SPS = 4
 BT = 0.35
 TX_ATTENUATION = 10.0
 
-# FPP framing parameters
-FPP_START_WORD = b'\xA5\xA5\xA5\xA5'
-FPP_HEADER_SIZE = 9  # start(4) + type(1) + size(4) — size field at offset 5
-
 # TCP parameters
 TCP_HOST = '0.0.0.0'
 TCP_PORT = 50000
+CHUNK_SIZE = 256        # max bytes per RF packet
+CHUNK_TIMEOUT = 0.05    # seconds to wait before sending partial chunk
 
 
 def make_packet(payload: bytes) -> bytes:
@@ -56,8 +53,8 @@ class tx_bridge(gr.top_block):
 
         # Message-based source: we'll push PDUs into this
         self.pdu_src = blocks.pdu_to_tagged_stream(
-                0, 'packet_len'
-                )
+            blocks.byte_t, 'packet_len'
+        )
 
         self.mod = digital.gmsk_mod(
             samples_per_symbol=SPS,
@@ -97,7 +94,7 @@ def tcp_server(bridge, stop_event):
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((TCP_HOST, TCP_PORT))
     srv.listen(1)
-    srv.settimeout(2.0)
+    srv.settimeout(1.0)
 
     print(f"  TCP listening on {TCP_HOST}:{TCP_PORT}")
     print(f"  Start Ref with: ./Ref -a 127.0.0.1 -p {TCP_PORT}")
@@ -109,7 +106,7 @@ def tcp_server(bridge, stop_event):
             continue
 
         print(f"  Ref connected from {addr}")
-        conn.settimeout(0.1)
+        conn.settimeout(CHUNK_TIMEOUT)
         buf = bytearray()
         pkt_count = 0
 
@@ -124,30 +121,17 @@ def tcp_server(bridge, stop_event):
                 pass
 
             # Send complete chunks
-            while len(buf) >= FPP_HEADER_SIZE:
-                # Find FPP start word
-                idx = buf.find(FPP_START_WORD)
-                if idx < 0:
-                    buf.clear()
-                    break
-                if idx > 0:
-                    buf = buf[idx:]  # discard junk before start word
-
-                if len(buf) < FPP_HEADER_SIZE:
-                    break
-
-                # FPP size field: big-endian u32 at offset 5
-                frame_size = struct.unpack_from('>I', buf, 5)[0]
-                total_len = 5 + 4 + frame_size
-
-                if len(buf) < total_len:
-                    break  # incomplete frame, wait for more
-
-                frame = bytes(buf[:total_len])
-                buf = buf[total_len:]
-                bridge.send_packet(frame)
+            while len(buf) >= CHUNK_SIZE:
+                chunk = bytes(buf[:CHUNK_SIZE])
+                buf = buf[CHUNK_SIZE:]
+                bridge.send_packet(chunk)
                 pkt_count += 1
-                time.sleep(0.002)  # 2ms inter-packet gap for RX to resync
+
+            # Send partial chunk on timeout (don't let data sit)
+            if buf and len(buf) < CHUNK_SIZE:
+                bridge.send_packet(bytes(buf))
+                pkt_count += 1
+                buf.clear()
 
         conn.close()
         print(f"  Sent {pkt_count} RF packets this session.")
