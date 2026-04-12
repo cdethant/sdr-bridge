@@ -2,6 +2,6 @@
 A bridge that routes the TCP interface of fprime & gds through SDR comms.
 
 Before doing anything, set up the following:
-gnuradio
-plutosdr
-rtl-sdr
+- gnuradio
+- plutosdr
+- rtl-sdr
