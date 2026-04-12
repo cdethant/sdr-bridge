@@ -20,7 +20,7 @@ import signal
 import sys
 import time
 
-from gnuradio import blocks, digital, gr
+from gnuradio import blocks, digital, gr 
 from gnuradio import iio
 
 # Protocol constants — must match RX bridge
@@ -53,7 +53,7 @@ class tx_bridge(gr.top_block):
 
         # Message-based source: we'll push PDUs into this
         self.pdu_src = blocks.pdu_to_tagged_stream(
-            blocks.byte_t, 'packet_len'
+            0, 'packet_len'
         )
 
         self.mod = digital.gmsk_mod(
