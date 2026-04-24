@@ -7,3 +7,22 @@ Before doing anything, set up the following:
 - rtl-sdr
 
 Because the bridge operates on two different hosts (1 for TX, 1 for RX), the respective branches hold the tx and rx side code.
+
+To run:
+1. On the GDS side:
+
+```
+fprime-gds -n -g html --gui-addr 0.0.0.0 \
+  --ip-address 0.0.0.0 \
+  --dictionary ./dict/RefTopologyDictionary.json \
+  --persistent-db
+```
+
+```python3 gds_rx.py```
+
+
+2. On the fprime side:
+
+```python3 gds_tx.py```
+
+```sudo ./Ref/build-artifacts/Linux/Ref/bin/Ref -a 127.0.0.1 -p 50000```
