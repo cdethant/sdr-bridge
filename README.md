@@ -25,4 +25,4 @@ fprime-gds -n -g html --gui-addr 0.0.0.0 \
 
 ```python3 gds_tx.py```
 
-```sudo ./Ref/build-artifacts/Linux/Ref/bin/Ref -a 100.64.56.2 -p 50000```
+```sudo ./Ref/build-artifacts/Linux/Ref/bin/Ref -a 127.0.0.1 -p 50000``` (Note the ref points to a local ip because the SDR is local)
