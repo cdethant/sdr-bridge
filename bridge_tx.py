@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-bridge_tx.py — Chunk 4: SPPs into CCSDS TM Transfer Frames with FHP.
+bridge_tx.py — Chunk 5 (patched): SPPs into CCSDS TM frames, GMSK over PlutoSDR.
 
-  - Listens on :50000 for Ref (impersonates the GDS).
-  - Generates the 'sitting well' heartbeat toward Ref locally.
+  - Listens on :50000 for Ref (impersonates the GDS, no heartbeat needed).
   - Chunks Ref's outgoing TCP stream into 1024-byte SPPs.
-  - Packs SPPs into 256-byte TM Transfer Frames with FHP-driven boundaries.
-  - Emits idle frames continuously when no data is available.
-  - Each frame is prefixed with the 4-byte ASM (0x1ACFFC1D) on the wire.
+  - Packs SPPs into 256-byte TM Transfer Frames with FHP.
+  - Emits idle frames continuously when no data is queued.
+  - Internal GR flowgraph: FrameSource -> gmsk_mod -> PlutoSDR sink.
+    (No intra-process TCP loop; FrameSource pulls from FrameProducer directly.)
 """
 import collections
 import signal
@@ -16,16 +16,20 @@ import struct
 import threading
 import time
 
+import numpy as np
+from gnuradio import gr, digital
+from gnuradio import iio
+
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 REF_LISTEN_HOST  = '0.0.0.0'
 REF_LISTEN_PORT  = 50000
 
-RX_HOST          = '100.64.56.2'
-RX_PORT          = 52000
-
-HEARTBEAT_BYTES  = b'sitting well'
-HEARTBEAT_PERIOD = 0.5
+CENTER_FREQ      = 433_000_000
+SAMP_RATE        = 2_000_000
+SPS              = 4
+BT               = 0.35
+TX_ATTENUATION   = 20.0
 
 RECV_BUF         = 4096
 
@@ -47,9 +51,6 @@ OTA_LEN          = len(ASM) + FRAME_LEN                  # 260
 FHP_NONE         = 0x7FF
 FHP_IDLE         = 0x7FE
 
-# Frame emission cadence when nothing is pending
-IDLE_FRAME_PERIOD = 0.05    # 50ms; 20 idle frames/sec keeps the link active
-
 
 # ─── CCSDS framing primitives ────────────────────────────────────────────────
 def crc16_ccitt(data: bytes, init: int = 0xFFFF) -> int:
@@ -63,9 +64,7 @@ def crc16_ccitt(data: bytes, init: int = 0xFFFF) -> int:
 
 def tm_primary_header(mcfc: int, vcfc: int, fhp: int) -> bytes:
     """6-byte TM Transfer Frame Primary Header per CCSDS 132.0-B-3 §4.1."""
-    # Word 0: TFVN(2)=00 | SCID(10) | VCID(3) | OCF(1)=0
     w0 = ((TM_SCID & 0x3FF) << 4) | ((TM_VCID & 0x7) << 1)
-    # Word 3: TFSH(1)=0 | Sync(1)=0 | PktOrder(1)=0 | SegLenID(2)=11 | FHP(11)
     w3 = (0b11 << 11) | (fhp & 0x7FF)
     return struct.pack('>HBBH', w0, mcfc & 0xFF, vcfc & 0xFF, w3)
 
@@ -73,12 +72,12 @@ def tm_primary_header(mcfc: int, vcfc: int, fhp: int) -> bytes:
 def build_frame(data_field: bytes, mcfc: int, vcfc: int, fhp: int) -> bytes:
     """Build one OTA frame: ASM + Primary Hdr + Data Field + FECF."""
     assert len(data_field) == DATA_FIELD_LEN
-    hdr = tm_primary_header(mcfc, vcfc, fhp)
+    hdr  = tm_primary_header(mcfc, vcfc, fhp)
     fecf = struct.pack('>H', crc16_ccitt(hdr + data_field))
     return ASM + hdr + data_field + fecf
 
 
-# ─── Fixed-size SPP parser (Chunk 3 v2) ──────────────────────────────────────
+# ─── Fixed-size SPP parser ───────────────────────────────────────────────────
 class FixedSizeParser:
     def __init__(self):
         self._buf = bytearray()
@@ -96,19 +95,17 @@ class FixedSizeParser:
             yield pkt
 
 
-# ─── SPP queue: thread-safe, used by both the TCP thread and the framer ─────
+# ─── SPP queue ───────────────────────────────────────────────────────────────
 class SppQueue:
     def __init__(self):
         self._q = collections.deque()
         self._lock = threading.Lock()
-        self._cond = threading.Condition(self._lock)
 
     def push(self, spp: bytes):
-        with self._cond:
+        with self._lock:
             self._q.append(spp)
-            self._cond.notify()
 
-    def pop_nowait(self) -> bytes | None:
+    def pop_nowait(self):
         with self._lock:
             return self._q.popleft() if self._q else None
 
@@ -117,18 +114,13 @@ class SppQueue:
             return len(self._q)
 
 
-# ─── Frame producer: pulls SPPs, emits frames continuously ──────────────────
+# ─── Frame producer ──────────────────────────────────────────────────────────
 class FrameProducer:
-    """
-    State: holds the currently-emitting SPP and its bit-offset.
-    Each frame: try to write 248 bytes from current SPP + queued SPPs.
-    Set FHP to the offset where the next SPP header lands in this frame,
-    or FHP_NONE if no SPP starts in this frame.
-    """
+    """Builds TM frames; idle-frames when queue empty."""
     def __init__(self, queue: SppQueue):
         self._q          = queue
-        self._current    = b''       # SPP being emitted
-        self._cur_off    = 0         # bytes already emitted from _current
+        self._current    = b''
+        self._cur_off    = 0
         self._mcfc       = 0
         self._vcfc       = 0
         self._n_data     = 0
@@ -140,17 +132,10 @@ class FrameProducer:
         with self._lock:
             return self._n_data, self._n_idle
 
-    def _build_data_field(self) -> tuple[bytes, int]:
-        """
-        Returns (data_field_bytes, fhp).
-        Greedily fills 248 bytes from the current SPP and the queue.
-        FHP = offset of first NEW SPP header in this frame, or FHP_NONE.
-        """
+    def _build_data_field(self):
         df = bytearray()
-        fhp = FHP_NONE  # default: no new SPP starts here
-
+        fhp = FHP_NONE
         while len(df) < DATA_FIELD_LEN:
-            # Need a new SPP?
             if self._cur_off >= len(self._current):
                 nxt = self._q.pop_nowait()
                 if nxt is None:
@@ -158,29 +143,20 @@ class FrameProducer:
                 self._current = nxt
                 self._cur_off = 0
                 if fhp == FHP_NONE:
-                    fhp = len(df)   # first new SPP starts at this byte
-
+                    fhp = len(df)
             take = min(DATA_FIELD_LEN - len(df),
                        len(self._current) - self._cur_off)
             df.extend(self._current[self._cur_off:self._cur_off + take])
             self._cur_off += take
-
-        # Pad with zeros if data field underflows (queue empty mid-frame)
         if len(df) < DATA_FIELD_LEN:
-            df.extend(b'\x00' * (DATA_FIELD_LEN - len(df)))
-
+            df.extend(b'\xAA' * (DATA_FIELD_LEN - len(df)))
         return bytes(df), fhp
 
     def next_frame(self) -> bytes:
-        """
-        Produce one OTA frame. Idle frame iff no SPP is in progress AND the
-        queue is empty.
-        """
         with self._lock:
-            queue_empty = (self._cur_off >= len(self._current)) and (len(self._q) == 0)
-            if queue_empty:
-                df  = b'\x00' * DATA_FIELD_LEN
-                fhp = FHP_IDLE
+            empty = (self._cur_off >= len(self._current)) and (len(self._q) == 0)
+            if empty:
+                df, fhp = b'\xAA' * DATA_FIELD_LEN, FHP_IDLE
                 self._n_idle += 1
             else:
                 df, fhp = self._build_data_field()
@@ -191,70 +167,57 @@ class FrameProducer:
             return frame
 
 
-# ─── Inter-bridge link (with reconnect) ──────────────────────────────────────
-class RxLink:
-    def __init__(self, host: str, port: int):
-        self._host = host
-        self._port = port
-        self._sock: socket.socket | None = None
-        self._lock = threading.Lock()
+# ─── GR custom source: pulls frames from FrameProducer ───────────────────────
+class FrameSource(gr.sync_block):
+    """
+    Continuous uint8 stream source. Pulls frames from FrameProducer on demand
+    and streams their bytes out. Never starves Pluto DMA: idle frames fill
+    any silence.
+    """
+    def __init__(self, producer: FrameProducer):
+        gr.sync_block.__init__(
+            self, name="ccsds_frame_source",
+            in_sig=None, out_sig=[np.uint8])
+        self._producer = producer
+        self._current  = b''
+        self._pos      = 0
 
-    def connect(self, stop_event: threading.Event):
-        while not stop_event.is_set():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect((self._host, self._port))
-                with self._lock:
-                    self._sock = s
-                print(f"[TX] Connected to bridge_rx at {self._host}:{self._port}")
-                return
-            except (ConnectionRefusedError, OSError) as e:
-                print(f"[TX] bridge_rx not ready ({e}), retrying in 2s")
-                time.sleep(2)
-
-    def send(self, data: bytes) -> bool:
-        with self._lock:
-            s = self._sock
-        if s is None:
-            return False
-        try:
-            s.sendall(data)
-            return True
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            print(f"[TX] Send to bridge_rx failed: {e}")
-            with self._lock:
-                if self._sock is s:
-                    self._sock.close()
-                    self._sock = None
-            return False
-
-    def close(self):
-        with self._lock:
-            if self._sock:
-                self._sock.close()
-                self._sock = None
+    def work(self, input_items, output_items):
+        out = output_items[0]
+        n   = len(out)
+        w   = 0
+        while w < n:
+            if self._pos >= len(self._current):
+                self._current = self._producer.next_frame()
+                self._pos = 0
+            take = min(n - w, len(self._current) - self._pos)
+            out[w:w+take] = np.frombuffer(
+                self._current[self._pos:self._pos+take], dtype=np.uint8)
+            self._pos += take
+            w += take
+        return n
 
 
-# ─── Frame emission loop ─────────────────────────────────────────────────────
-def emit_frames(producer: FrameProducer, rx: RxLink, stop_event: threading.Event):
-    last_idle = 0.0
-    while not stop_event.is_set():
-        # If queue is empty, throttle idle frames to a reasonable rate
-        if len(producer._q) == 0 and (producer._cur_off >= len(producer._current)):
-            now = time.monotonic()
-            if now - last_idle < IDLE_FRAME_PERIOD:
-                time.sleep(0.005)
-                continue
-            last_idle = time.monotonic()
+# ─── TX flowgraph: FrameSource -> GMSK mod -> PlutoSDR sink ──────────────────
+class TxFlowgraph(gr.top_block):
+    def __init__(self, producer: FrameProducer):
+        gr.top_block.__init__(self, "TX Flowgraph", catch_exceptions=True)
+        self.src = FrameSource(producer)
+        self.mod = digital.gmsk_mod(
+            samples_per_symbol=SPS, bt=BT,
+            verbose=False, log=False, do_unpack=True)
+        uri = iio.get_pluto_uri()
+        self.sink = iio.fmcomms2_sink_fc32(uri, [True, True], 32768, False)
+        self.sink.set_len_tag_key('')
+        self.sink.set_frequency(CENTER_FREQ)
+        self.sink.set_samplerate(SAMP_RATE)
+        self.sink.set_bandwidth(SAMP_RATE)
+        self.sink.set_attenuation(0, TX_ATTENUATION)
+        self.sink.set_filter_params('Auto', '', 0, 0)
+        self.connect(self.src, self.mod, self.sink)
 
-        frame = producer.next_frame()
-        if not rx.send(frame):
-            threading.Thread(target=rx.connect, args=(stop_event,),
-                             daemon=True).start()
-            time.sleep(0.5)
 
-
-# ─── Per-Ref-connection handler ──────────────────────────────────────────────
+# ─── Ref-side TCP server ─────────────────────────────────────────────────────
 def handle_ref(conn: socket.socket, addr, queue: SppQueue,
                stop_event: threading.Event):
     print(f"[TX] Ref connected from {addr}")
@@ -263,19 +226,9 @@ def handle_ref(conn: socket.socket, addr, queue: SppQueue,
     parser    = FixedSizeParser()
     bytes_in  = 0
     spp_count = 0
-    last_hb   = 0.0
 
     try:
         while not stop_event.is_set():
-            now = time.monotonic()
-            if now - last_hb >= HEARTBEAT_PERIOD:
-                try:
-                    conn.sendall(HEARTBEAT_BYTES)
-                    last_hb = now
-                except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                    print(f"[TX] Heartbeat send failed: {e}")
-                    break
-
             try:
                 data = conn.recv(RECV_BUF)
                 if not data:
@@ -308,7 +261,6 @@ def serve_ref(queue: SppQueue, stop_event: threading.Event):
     srv.listen(1)
     srv.settimeout(1.0)
     print(f"[TX] Listening for Ref on {REF_LISTEN_HOST}:{REF_LISTEN_PORT}")
-
     try:
         while not stop_event.is_set():
             try:
@@ -320,30 +272,26 @@ def serve_ref(queue: SppQueue, stop_event: threading.Event):
         srv.close()
 
 
+# ─── Main ────────────────────────────────────────────────────────────────────
 def main():
     stop_event = threading.Event()
     signal.signal(signal.SIGINT,  lambda *_: stop_event.set())
     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
 
-    print("=== bridge_tx.py — Chunk 4: TM frames with FHP ===")
-    print(f"    OTA frame:    ASM(4) + TF({FRAME_LEN}) = {OTA_LEN}B")
-    print(f"    Data field:   {DATA_FIELD_LEN}B per frame")
-    print(f"    bridge_rx:    {RX_HOST}:{RX_PORT}")
+    print("=== bridge_tx.py — Chunk 5 (patched): TM over GMSK/PlutoSDR ===")
+    print(f"    Frequency:  {CENTER_FREQ/1e6:.1f} MHz")
+    print(f"    Modulation: GMSK (BT={BT}, SPS={SPS}, "
+          f"symbol rate={SAMP_RATE/SPS/1000:.0f} ksym/s)")
+    print(f"    OTA frame:  ASM(4) + TF({FRAME_LEN}) = {OTA_LEN}B")
 
     queue    = SppQueue()
-    rx       = RxLink(RX_HOST, RX_PORT)
     producer = FrameProducer(queue)
 
-    rx.connect(stop_event)
-    if stop_event.is_set():
-        return
+    print("[TX] Starting internal GNU Radio flowgraph...")
+    tb = TxFlowgraph(producer)
+    tb.start()
+    print("[TX] PlutoSDR streaming.")
 
-    # Frame emitter runs in the background
-    emitter = threading.Thread(
-        target=emit_frames, args=(producer, rx, stop_event), daemon=True)
-    emitter.start()
-
-    # Periodic stats
     def stats_loop():
         t0 = time.time()
         while not stop_event.is_set():
@@ -354,7 +302,9 @@ def main():
     threading.Thread(target=stats_loop, daemon=True).start()
 
     serve_ref(queue, stop_event)
-    rx.close()
+
+    print("[TX] Stopping flowgraph...")
+    tb.stop(); tb.wait()
     print("[TX] Stopped.")
 
 
