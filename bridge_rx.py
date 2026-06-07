@@ -80,33 +80,51 @@ class packet_sink(gr.sync_block):
         with self._lock:
             return self._pkt_count
 
-    def _bits_to_bytes(self, bits):
-        out = bytearray()
-        for i in range(0, len(bits) - 7, 8):
-            val = 0
-            for j in range(8):
-                val = (val << 1) | (bits[i + j] & 1)
-            out.append(val)
-        return bytes(out)
-
     def work(self, input_items, output_items):
         inp = input_items[0]
         tags = self.get_tags_in_window(0, 0, len(inp))
 
-        sync_offsets = set()
+        sync_offsets = []
         for tag in tags:
             if pmt.symbol_to_string(tag.key) == 'sync':
-                sync_offsets.add(int(tag.offset - self.nitems_read(0)))
+                sync_offsets.append(int(tag.offset - self.nitems_read(0)))
+        sync_offsets.sort()
 
-        for i, bit in enumerate(inp):
-            if i in sync_offsets:
-                self._state = 'READ_PAYLOAD'
-                self._bit_buf = []
+        idx = 0
+        while idx < len(inp):
+            if self._state == 'HUNT':
+                next_sync = None
+                for so in sync_offsets:
+                    if so >= idx:
+                        next_sync = so
+                        break
+                if next_sync is not None:
+                    self._state = 'READ_PAYLOAD'
+                    self._bit_buf = []
+                    idx = next_sync
+                else:
+                    break
+            elif self._state == 'READ_PAYLOAD':
+                need = FRAME_LEN * 8 - len(self._bit_buf)
+                
+                next_sync = None
+                for so in sync_offsets:
+                    if so > idx and so < idx + need:
+                        next_sync = so
+                        break
+                
+                if next_sync is not None:
+                    idx = next_sync
+                    self._state = 'READ_PAYLOAD'
+                    self._bit_buf = []
+                    continue
 
-            if self._state == 'READ_PAYLOAD':
-                self._bit_buf.append(int(bit))
+                take = min(need, len(inp) - idx)
+                self._bit_buf.extend(inp[idx : idx + take])
+                idx += take
+
                 if len(self._bit_buf) == FRAME_LEN * 8:
-                    payload = self._bits_to_bytes(self._bit_buf)
+                    payload = np.packbits(np.array(self._bit_buf, dtype=np.uint8)).tobytes()
                     with self._lock:
                         self._pkt_count += 1
                     
@@ -167,7 +185,7 @@ class RxFlowgraph(gr.top_block):
 # ─── GDS link ────────────────────────────────────────────────────────────────
 class GdsLink:
     def __init__(self, host: str, port: int):
-        self._host = '0.0.0.0'
+        self._host = host
         self._port = port
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
@@ -212,7 +230,9 @@ class GdsLink:
         if s is None:
             return 0
         try:
+            s.settimeout(0.0)
             data = s.recv(RECV_BUF)
+            s.settimeout(0.1)
             if not data:
                 print("[RX] GDS closed its side.")
                 with self._lock:
@@ -221,7 +241,11 @@ class GdsLink:
                         self._sock = None
                 return 0
             return len(data)
+        except BlockingIOError:
+            s.settimeout(0.1)
+            return 0
         except socket.timeout:
+            s.settimeout(0.1)
             return 0
         except (ConnectionResetError, OSError):
             with self._lock:
@@ -288,6 +312,8 @@ class FrameReader:
             fecf_recv  = struct.unpack(
                 '>H', frame[HEADER_LEN + DATA_FIELD_LEN:])[0]
             if crc16_ccitt(hdr_and_df) != fecf_recv:
+                if self.n_crc_bad < 3:
+                    print(f"[RX] CRC BAD dump: hdr={frame[:10].hex()}... expected_crc={fecf_recv:04x} calc={crc16_ccitt(hdr_and_df):04x}")
                 self.n_crc_bad += 1
                 del self._buf[:idx + 1]
                 continue
@@ -356,7 +382,7 @@ class SppReassembler:
 
 
 # ─── Receive loop ────────────────────────────────────────────────────────────
-def process_frames(gds: GdsLink, frame_queue: queue.Queue, stop_event: threading.Event):
+def process_frames(gds: GdsLink, frame_queue: queue.Queue, stop_event: threading.Event, pkt_sink: packet_sink):
     reader = FrameReader()
     bytes_to_gds = 0
 
@@ -379,6 +405,9 @@ def process_frames(gds: GdsLink, frame_queue: queue.Queue, stop_event: threading
 
     reassembler = SppReassembler(on_spp)
 
+    start_time = time.time()
+    last_print = start_time
+
     while not stop_event.is_set():
         try:
             data = frame_queue.get(timeout=0.1)
@@ -392,6 +421,16 @@ def process_frames(gds: GdsLink, frame_queue: queue.Queue, stop_event: threading
             pass
 
         gds.drain_heartbeat()
+        
+        now = time.time()
+        if now - last_print >= 5.0:
+            last_print = now
+            print(f"[RX] [{(now - start_time):5.0f}s] "
+                  f"frames_detected={pkt_sink.pkt_count} "
+                  f"frames_good={reader.n_crc_good} "
+                  f"frames_bad={reader.n_crc_bad} "
+                  f"spps={reassembler.n_spp}")
+
 
     print(f"[RX] Session ended. "
           f"frames_good={reader.n_crc_good} frames_bad={reader.n_crc_bad} "
@@ -420,7 +459,7 @@ def main():
     tb.start()
     print("[RX] RTL-SDR listening.")
 
-    process_frames(gds, frame_queue, stop_event)
+    process_frames(gds, frame_queue, stop_event, tb.pkt_sink)
 
     print("[RX] Stopping flowgraph...")
     tb.stop()
