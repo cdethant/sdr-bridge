@@ -30,12 +30,14 @@ import time
 ##################################################
 # Protocol constants — must match TX
 ##################################################
-SYNC_WORD = 0xDEADBEEF
-PREAMBLE_LEN = 32
+SYNC_WORD = 0x1ACFFC1D
+PREAMBLE_LEN = 0 # Not used for TM frame
  
 # Sync word as a bit string for the correlator
 SYNC_BITS = ''.join(f'{b:08b}' for b in struct.pack('>I', SYNC_WORD))
- 
+ASM_BYTES = struct.pack('>I', SYNC_WORD)
+FRAME_LEN = 256
+
 ##################################################
 # RF parameters — must match TX
 ##################################################
@@ -49,17 +51,15 @@ PPM_CORRECTION = 12           # from rtl_test -p
 RF_GAIN = 30                  # dB
 IF_GAIN = 20                  # dB
 BB_GAIN = 20                  # dB
- 
- 
+
+import socket
+
 class packet_sink(gr.sync_block):
     """
     Receives the tagged, unpacked bit stream from the correlator.
-    On each 'sync' tag (placed by correlate_access_code_tag):
-      - reads the next 16 bits as big-endian payload length
-      - reads that many bytes of payload
-      - prints the decoded payload
+    On each 'sync' tag, reads 256 bytes of payload (2048 bits),
+    and sends ASM + 256 bytes over TCP to gds_rx.py.
     """
- 
     def __init__(self):
         gr.sync_block.__init__(
             self,
@@ -67,20 +67,34 @@ class packet_sink(gr.sync_block):
             in_sig=[np.uint8],
             out_sig=None,
         )
-        self._buffer = bytearray()
-        self._state = 'HUNT'    # HUNT → GOT_SYNC → READ_LEN → READ_PAYLOAD
-        self._pkt_len = 0
+        self._state = 'HUNT'
         self._bit_buf = []
         self._pkt_count = 0
         self._lock = threading.Lock()
- 
+        
+        self.clients = []
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(('0.0.0.0', 50002))
+        self.srv.listen(1)
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while True:
+            try:
+                conn, addr = self.srv.accept()
+                with self._lock:
+                    self.clients.append(conn)
+                print(f"[RX TCP] Client connected from {addr}")
+            except Exception as e:
+                print(f"[RX TCP] Accept error: {e}")
+
     @property
     def pkt_count(self):
         with self._lock:
             return self._pkt_count
  
     def _bits_to_bytes(self, bits):
-        """Pack a list of 0/1 ints into bytes, MSB first."""
         out = bytearray()
         for i in range(0, len(bits) - 7, 8):
             val = 0
@@ -93,7 +107,6 @@ class packet_sink(gr.sync_block):
         inp = input_items[0]
         tags = self.get_tags_in_window(0, 0, len(inp))
  
-        # Build a set of tag offsets (relative to this buffer)
         sync_offsets = set()
         for tag in tags:
             if pmt.symbol_to_string(tag.key) == 'sync':
@@ -101,43 +114,30 @@ class packet_sink(gr.sync_block):
  
         for i, bit in enumerate(inp):
             if i in sync_offsets:
-                # Sync word found — start collecting length field
-                self._state = 'READ_LEN'
+                self._state = 'READ_PAYLOAD'
                 self._bit_buf = []
  
-            if self._state == 'READ_LEN':
+            if self._state == 'READ_PAYLOAD':
                 self._bit_buf.append(int(bit))
-                if len(self._bit_buf) == 16:  # 2 bytes for length
-                    len_bytes = self._bits_to_bytes(self._bit_buf)
-                    self._pkt_len = struct.unpack('>H', len_bytes)[0]
-                    self._bit_buf = []
-                    if self._pkt_len == 0 or self._pkt_len > 4096:
-                        # Bogus length — probably a false sync
-                        self._state = 'HUNT'
-                    else:
-                        self._state = 'READ_PAYLOAD'
- 
-            elif self._state == 'READ_PAYLOAD':
-                self._bit_buf.append(int(bit))
-                if len(self._bit_buf) == self._pkt_len * 8:
+                if len(self._bit_buf) == FRAME_LEN * 8:
                     payload = self._bits_to_bytes(self._bit_buf)
                     with self._lock:
                         self._pkt_count += 1
                         count = self._pkt_count
-                    # Print decoded packet
-                    try:
-                        text = payload.decode('utf-8', errors='replace')
-                    except Exception:
-                        text = payload.hex()
-                    print(f"[PKT {count:>4d}] "
-                          f"len={self._pkt_len} "
-                          f"hex={payload[:16].hex()}"
-                          f"{'...' if len(payload) > 16 else ''} "
-                          f"ascii=\"{text}\"")
+                        clients = list(self.clients)
+                    
+                    frame = ASM_BYTES + payload
+                    for c in clients:
+                        try:
+                            c.sendall(frame)
+                        except Exception:
+                            with self._lock:
+                                if c in self.clients:
+                                    self.clients.remove(c)
+                                    
+                    print(f"[PKT {count:>4d}] sent frame over TCP")
                     self._state = 'HUNT'
                     self._bit_buf = []
- 
-            # else: HUNT — just consume bits until correlator fires
  
         return len(inp)
  
